@@ -9,9 +9,13 @@
 #define MAX_LINE 200
 #define MAX_OUTPUT 96
 #define MAX_STATUS 768
+#define DEFAULT_SLEEP_TIME 2
 
 typedef struct {
-    char *data;
+    char *prefix;
+    char *cmd;
+    char *suffix;
+    int shell;
 } Task;
 
 static inline char *skip_spaces(char *s) {
@@ -22,18 +26,13 @@ static inline char *skip_spaces(char *s) {
 static char *get_config_path(void) {
     static char path[256];
     const char *home = getenv("HOME");
-    if (!home) home = ".";
+    if (!home || !*home) {
+        fprintf(stderr, "Error: HOME env not set\n");
+        exit(1);
+    }
     
     snprintf(path, sizeof(path), "%s/.config/barli.conf", home);
     if (access(path, F_OK) == 0) return path;
-    
-    snprintf(path, sizeof(path), "%s/.barli.conf", home);
-    if (access(path, F_OK) == 0) return path;
-    
-    snprintf(path, sizeof(path), "%s/.config/barli.conf", home);
-    char dir[256];
-    snprintf(dir, sizeof(dir), "%s/.config", home);
-    mkdir(dir, 0755);
     
     FILE *f = fopen(path, "w");
     if (f) {
@@ -43,55 +42,94 @@ static char *get_config_path(void) {
     return path;
 }
 
-static int load_tasks(Task *tasks) {
+static void parse_and_store_task(const char *data, Task *task) {
+    char *buf = strdup(data);
+    if (!buf) return;
+    
+    task->prefix = buf;
+    task->cmd = task->suffix = "";
+    task->shell = 0;
+    
+    char *p = strstr(buf, "::");
+    if (!p) return;
+    *p = 0;
+    task->cmd = skip_spaces(p + 2);
+    
+    p = strstr(task->cmd, "::");
+    if (p) {
+        *p = 0;
+        task->suffix = skip_spaces(p + 2);
+        p = strstr(task->suffix, "::");
+        if (p) {
+            *p = 0;
+            char *sh = skip_spaces(p + 2);
+            task->shell = (*sh == 's' || *sh == 'S');
+        }
+    }
+}
+
+static int load_tasks(Task *tasks, int *sleep_time) {
     int count = 0;
+    *sleep_time = DEFAULT_SLEEP_TIME;
+    
     FILE *f = fopen(get_config_path(), "r");
     if (!f) return 0;
     
     char line[MAX_LINE];
+    int first_line = 1;
+    
     while (fgets(line, sizeof(line), f) && count < MAX_TASKS) {
         line[strcspn(line, "\n")] = 0;
         char *s = skip_spaces(line);
+        
+        if (first_line && *s && *s != '#') {
+            if (strncmp(s, "SLEEP_TIME:", 11) == 0) {
+                int val = atoi(skip_spaces(s + 11));
+                if (val > 0) *sleep_time = val;
+                first_line = 0;
+                continue;
+            }
+            first_line = 0;
+        }
+        
         if (!*s || *s == '#') continue;
         
         if (strstr(s, "::") && strstr(s, "::")[2]) {
-            tasks[count++].data = strdup(s);
+            parse_and_store_task(s, &tasks[count]);
+            count++;
         }
     }
     fclose(f);
     return count;
 }
 
-static void parse_task(const char *data, char **prefix, char **cmd, 
-                       char **suffix, int *shell) {
-    static char buf[MAX_LINE];
-    strncpy(buf, data, MAX_LINE - 1);
-    buf[MAX_LINE - 1] = 0;
-    
-    *prefix = buf;
-    *cmd = *suffix = "";
-    *shell = 0;
-    
-    char *p = strstr(buf, "::");
-    if (!p) return;
-    *p = 0;
-    *cmd = skip_spaces(p + 2);
-    
-    p = strstr(*cmd, "::");
-    if (p) {
-        *p = 0;
-        *suffix = p + 2;
-        p = strstr(*suffix, "::");
-        if (p) {
-            *p = 0;
-            char *sh = skip_spaces(p + 2);
-            *shell = (*sh == 's' || *sh == 'S');
-        }
-    }
-}
-
 static int run_command(const char *cmd, int shell, char *out, int size) {
-    FILE *fp = popen(shell ? cmd : cmd, "r");
+    char cmdline[MAX_LINE * 2];
+    if (shell) {
+        char escaped[MAX_LINE * 2];
+        char *dst = escaped;
+        const char *src = cmd;
+        
+        while (*src && (dst - escaped) < (int)sizeof(escaped) - 10) {
+            if (*src == '\'') {
+                *dst++ = '\'';
+                *dst++ = '\\';
+                *dst++ = '\'';
+                *dst++ = '\'';
+            } else {
+                *dst++ = *src;
+            }
+            src++;
+        }
+        *dst = 0;
+        
+        snprintf(cmdline, sizeof(cmdline), "sh -c '%s'", escaped);
+    } else {
+        strncpy(cmdline, cmd, sizeof(cmdline) - 1);
+        cmdline[sizeof(cmdline) - 1] = 0;
+    }
+    
+    FILE *fp = popen(cmdline, "r");
     if (!fp) return 0;
     
     int has_output = 0;
@@ -110,7 +148,8 @@ int main(void) {
     Window root = DefaultRootWindow(dpy);
     
     Task tasks[MAX_TASKS];
-    int ntasks = load_tasks(tasks);
+    int sleep_time;
+    int ntasks = load_tasks(tasks, &sleep_time);
     if (!ntasks) {
         XCloseDisplay(dpy);
         return 1;
@@ -118,41 +157,52 @@ int main(void) {
     
     char status[MAX_STATUS];
     char output[MAX_OUTPUT];
-    char *sp;
     
     for (;;) {
-        sp = status;
+        char *sp = status;
         *sp = 0;
         
         for (int i = 0; i < ntasks; i++) {
-            char *pfx, *cmd, *sfx;
-            int shell;
-            parse_task(tasks[i].data, &pfx, &cmd, &sfx, &shell);
-            
-            if (run_command(cmd, shell, output, MAX_OUTPUT)) {
-                if (sp != status) *sp++ = '|';
-                *sp++ = ' ';
-                
-                if (*pfx) {
-                    strcpy(sp, pfx);
-                    sp += strlen(pfx);
+            if (run_command(tasks[i].cmd, tasks[i].shell, output, MAX_OUTPUT)) {
+                if (sp != status) {
+                    int remaining = MAX_STATUS - (sp - status);
+                    if (remaining > 3) {
+                        *sp++ = ' ';
+                        *sp++ = '|';
+                        *sp++ = ' ';
+                    }
                 }
                 
-                strcpy(sp, output);
-                sp += strlen(output);
-                
-                if (*sfx) {
-                    strcpy(sp, sfx);
-                    sp += strlen(sfx);
+                if (*tasks[i].prefix) {
+                    int len = strlen(tasks[i].prefix);
+                    int remaining = MAX_STATUS - (sp - status);
+                    if (len < remaining) {
+                        strcpy(sp, tasks[i].prefix);
+                        sp += len;
+                    }
                 }
                 
-                if (!*pfx && !*sfx) *sp++ = ' ';
+                int len = strlen(output);
+                int remaining = MAX_STATUS - (sp - status);
+                if (len < remaining) {
+                    strcpy(sp, output);
+                    sp += len;
+                }
+                
+                if (*tasks[i].suffix) {
+                    int len = strlen(tasks[i].suffix);
+                    int remaining = MAX_STATUS - (sp - status);
+                    if (len < remaining) {
+                        strcpy(sp, tasks[i].suffix);
+                        sp += len;
+                    }
+                }
             }
         }
         *sp = 0;
         
         XStoreName(dpy, root, status);
         XFlush(dpy);
-        sleep(1);
+        sleep(sleep_time);
     }
 }

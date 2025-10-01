@@ -6,7 +6,7 @@ It runs shell commands (or plain executables) at given intervals and updates the
 ---
 
 ## Features
-- Simple text-based configuration file (`~/.config/barli.conf` or `~/.barli.conf`).  
+- Simple text-based configuration file (`~/.config/barli.conf`).  
 - Runs commands periodically and displays their output.  
 - Supports both plain commands and full shell commands.  
 
@@ -27,6 +27,7 @@ prefix :: command :: suffix :: [shell]
 
 ### Example (`~/.config/barli.conf`)
 ```txt
+SLEEP_TIME: 3
 Clock :: date :: :: 
 Mem :: free -h | awk 'NR==2{print $3}' :: used :: shell
 ````
